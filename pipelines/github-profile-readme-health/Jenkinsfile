@@ -22,9 +22,8 @@ pipeline {
                     if (!schedule) {
                         error('jenkins.cron must be set in profile-readme-health/config.yml')
                     }
-                    // The YAML controls this job's schedule. The first build must be run manually.
                     properties([pipelineTriggers([cron(schedule)])])
-                    echo "Configured daily schedule from YAML: ${schedule} (Jenkins controller timezone)"
+                    echo "Configured schedule from YAML: ${schedule} (Jenkins controller timezone)"
                 }
             }
         }
@@ -36,8 +35,8 @@ pipeline {
                     command -v python3 >/dev/null || { echo 'python3 is required on this Jenkins agent'; exit 2; }
                     python3 -m venv .venv-profile-readme-health
                     .venv-profile-readme-health/bin/python -m pip install --disable-pip-version-check -r ci-config/profile-readme-health/requirements.txt
-                    .venv-profile-readme-health/bin/python ci-config/profile-readme-health/check_profile.py \\
-                      --config ci-config/profile-readme-health/config.yml \\
+                    .venv-profile-readme-health/bin/python ci-config/profile-readme-health/check_profile.py \
+                      --config ci-config/profile-readme-health/config.yml \
                       --report-dir reports
                 '''
             }
@@ -52,7 +51,117 @@ pipeline {
             echo 'GitHub profile README health check passed.'
         }
         failure {
-            echo 'GitHub profile README health check failed. Open the build console and archived report for details.'
+            echo 'GitHub profile README health check failed. Sending WhatsApp alert.'
+            script {
+                // Notify on failures only. Notification errors must not hide the original build failure.
+                if (!fileExists('ci-config/profile-readme-health/config.yml')) {
+                    echo 'WARNING: CI config is unavailable; WhatsApp notification was skipped.'
+                } else {
+                    try {
+                        def cfg = readYaml file: 'ci-config/profile-readme-health/config.yml'
+                        def twilio = cfg?.twilio ?: [:]
+                        def mode = (twilio.notification_mode ?: 'template').toString().trim().toLowerCase()
+                        def contentSid = (twilio.content_sid ?: '').toString().trim()
+                        if (!(mode in ['body', 'template'])) {
+                            error("twilio.notification_mode must be 'body' or 'template'")
+                        }
+                        if (mode == 'template' && (!contentSid || contentSid == 'REPLACE_WITH_APPROVED_CONTENT_SID')) {
+                            error('Set twilio.content_sid to your approved Twilio WhatsApp template Content SID in config.yml')
+                        }
+
+                        int notifyStatus = 1
+                        withCredentials([
+                            usernamePassword(
+                                credentialsId: 'twilio-account-sid-auth-token',
+                                usernameVariable: 'TWILIO_ACCOUNT_SID',
+                                passwordVariable: 'TWILIO_AUTH_TOKEN'
+                            ),
+                            string(credentialsId: 'twilio-whatsapp-from', variable: 'TWILIO_WHATSAPP_FROM'),
+                            string(credentialsId: 'twilio-whatsapp-to', variable: 'TWILIO_WHATSAPP_TO')
+                        ]) {
+                            withEnv([
+                                "TWILIO_WHATSAPP_MODE=${mode}",
+                                "TWILIO_WHATSAPP_CONTENT_SID=${contentSid}"
+                            ]) {
+                                notifyStatus = sh(script: '''#!/usr/bin/env bash
+                                    set -euo pipefail
+                                    set +x
+                                    mkdir -p reports
+
+                                    CONTENT_VARIABLES="$(python3 - <<'PY'
+import json, os
+from pathlib import Path
+reason = 'Health check failed; see Jenkins build report.'
+path = Path('reports/profile-readme-health.json')
+if path.exists():
+    try:
+        errors = json.loads(path.read_text(encoding='utf-8')).get('errors') or []
+        if errors:
+            reason = str(errors[0])
+    except Exception:
+        pass
+print(json.dumps({
+    '1': os.environ.get('JOB_NAME', 'github-profile-readme-health'),
+    '2': os.environ.get('BUILD_NUMBER', 'unknown'),
+    '3': reason[:700],
+    '4': os.environ.get('BUILD_URL', '')
+}, ensure_ascii=False))
+PY
+                                    )"
+
+                                    CURL_ARGS=(
+                                      --fail --silent --show-error --max-time 30
+                                      --user "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN"
+                                      --request POST
+                                      "https://api.twilio.com/2010-04-01/Accounts/$TWILIO_ACCOUNT_SID/Messages.json"
+                                      --data-urlencode "From=$TWILIO_WHATSAPP_FROM"
+                                      --data-urlencode "To=$TWILIO_WHATSAPP_TO"
+                                    )
+
+                                    if [[ "$TWILIO_WHATSAPP_MODE" == "template" ]]; then
+                                      CURL_ARGS+=(--data-urlencode "ContentSid=$TWILIO_WHATSAPP_CONTENT_SID")
+                                      CURL_ARGS+=(--data-urlencode "ContentVariables=$CONTENT_VARIABLES")
+                                    else
+                                      # Body mode is only for initial Sandbox testing in an open 24-hour window.
+                                      ALERT_BODY="$(python3 - <<'PY'
+import json, os
+from pathlib import Path
+reason = 'Health check failed; see Jenkins build report.'
+path = Path('reports/profile-readme-health.json')
+if path.exists():
+    try:
+        errors = json.loads(path.read_text(encoding='utf-8')).get('errors') or []
+        if errors:
+            reason = str(errors[0])
+    except Exception:
+        pass
+print('\n'.join([
+    'Jenkins failure: GitHub profile README health check',
+    'Job: ' + os.environ.get('JOB_NAME', 'github-profile-readme-health'),
+    'Build: #' + os.environ.get('BUILD_NUMBER', 'unknown'),
+    'Issue: ' + reason[:500],
+    'Build URL: ' + os.environ.get('BUILD_URL', '')
+]))
+PY
+                                      )"
+                                      CURL_ARGS+=(--data-urlencode "Body=$ALERT_BODY")
+                                    fi
+
+                                    curl "${CURL_ARGS[@]}" --output reports/twilio-message-response.json
+                                    echo 'Twilio accepted the WhatsApp message request.'
+                                ''', returnStatus: true)
+                            }
+                        }
+                        if (notifyStatus != 0) {
+                            echo "WARNING: WhatsApp notification failed (exit code ${notifyStatus}). The original Jenkins build remains failed. Check the console and Twilio response report."
+                        }
+                    } catch (Exception notificationError) {
+                        echo "WARNING: Could not send WhatsApp notification: ${notificationError.getMessage()}. The original Jenkins build remains failed."
+                    }
+                }
+                // The first 'always' archive runs before post-failure notification, so archive the Twilio response afterward too.
+                archiveArtifacts artifacts: 'reports/twilio-message-response.json', allowEmptyArchive: true
+            }
         }
     }
 }
