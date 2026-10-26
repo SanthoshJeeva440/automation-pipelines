@@ -1,0 +1,58 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        timeout(time: 15, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    stages {
+        stage('Checkout CI config') {
+            steps {
+                dir('ci-config') {
+                    git branch: 'main', url: 'https://github.com/SanthoshJeeva440/automation-ci-config.git'
+                }
+                script {
+                    if (!fileExists('ci-config/profile-readme-health/config.yml')) {
+                        error('Missing ci-config/profile-readme-health/config.yml')
+                    }
+                    def cfg = readYaml file: 'ci-config/profile-readme-health/config.yml'
+                    def schedule = cfg?.jenkins?.cron?.toString()?.trim()
+                    if (!schedule) {
+                        error('jenkins.cron must be set in profile-readme-health/config.yml')
+                    }
+                    // The YAML controls this job's schedule. The first build must be run manually.
+                    properties([pipelineTriggers([cron(schedule)])])
+                    echo "Configured daily schedule from YAML: ${schedule} (Jenkins controller timezone)"
+                }
+            }
+        }
+
+        stage('Check rendered profile README') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    command -v python3 >/dev/null || { echo 'python3 is required on this Jenkins agent'; exit 2; }
+                    python3 -m venv .venv-profile-readme-health
+                    .venv-profile-readme-health/bin/python -m pip install --disable-pip-version-check -r ci-config/profile-readme-health/requirements.txt
+                    .venv-profile-readme-health/bin/python ci-config/profile-readme-health/check_profile.py \\
+                      --config ci-config/profile-readme-health/config.yml \\
+                      --report-dir reports
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+        }
+        success {
+            echo 'GitHub profile README health check passed.'
+        }
+        failure {
+            echo 'GitHub profile README health check failed. Open the build console and archived report for details.'
+        }
+    }
+}
