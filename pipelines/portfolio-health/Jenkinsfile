@@ -1,0 +1,79 @@
+pipeline {
+    agent any
+    options {
+        timeout(time: 20, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timestamps()
+    }
+    stages {
+        stage('Checkout pipeline repository') {
+            steps { checkout scm }
+        }
+        stage('Checkout CI configuration') {
+            steps {
+                dir('ci-config') {
+                    git branch: 'main',
+                        url: 'https://github.com/SanthoshJeeva440/automation-ci-config.git'
+                }
+            }
+        }
+        stage('Load configuration and schedule') {
+            steps {
+                script {
+                    def config = readYaml file: 'ci-config/portfolio-health/config.yml'
+                    def schedule = config?.jenkins?.cron ?: '0 6,18 * * *'
+                    properties([pipelineTriggers([cron(schedule)])])
+                }
+            }
+        }
+        stage('Install Python dependencies') {
+            steps {
+                dir('ci-config/portfolio-health') {
+                    sh '''
+                        python3 -m venv .venv
+                        . .venv/bin/activate
+                        python -m pip install --upgrade pip
+                        pip install -r requirements.txt
+                        python -m playwright install chromium
+                    '''
+                }
+            }
+        }
+        stage('Run portfolio health checks') {
+            steps {
+                dir('ci-config/portfolio-health') {
+                    sh '''
+                        . .venv/bin/activate
+                        python check_portfolio.py --config config.yml --report-dir ../../../reports
+                    '''
+                }
+            }
+        }
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+        }
+        failure {
+            script {
+                def config = readYaml file: 'ci-config/portfolio-health/config.yml'
+                def enabled = config?.notifications?.email?.enabled ?: false
+                def recipient = config?.notifications?.email?.to ?: ''
+                if (enabled && recipient?.trim()) {
+                    emailext(
+                        to: recipient,
+                        subject: "${config?.notifications?.email?.subject_prefix ?: '[Portfolio Health Check]'} FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        body: """Portfolio health check failed.
+
+Job: ${env.JOB_NAME}
+Build: ${env.BUILD_URL}
+
+Review the Jenkins console output and archived reports.
+""",
+                        attachLog: true
+                    )
+                }
+            }
+        }
+    }
+}
