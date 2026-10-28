@@ -1,0 +1,136 @@
+pipeline {
+    agent none
+
+    options {
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timeout(time: 90, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        choice(name: 'AGENT', choices: ['linux-agent-1', 'mac-agent-1', 'Built-In Node', 'agent-git'], description: 'Select Jenkins agent')
+        choice(name: 'ENV', choices: ['dev', 'qa', 'prod'], description: 'Target environment')
+        choice(name: 'BROWSER', choices: ['chromium', 'firefox', 'webkit'], description: 'Browser to use')
+        string(name: 'TAGS', defaultValue: '@smoke', trim: true, description: 'Robot tag to include')
+        booleanParam(name: 'HEADLESS', defaultValue: true, description: 'Run browser tests headlessly')
+        string(name: 'EMAIL_TO', defaultValue: 'santhoshjeeva440@gmail.com', trim: true, description: 'Email address to receive test execution results')
+    }
+
+    stages {
+        stage('Run Robot Framework tests') {
+            agent { label params.AGENT }
+            stages {
+                stage('Checkout CI configuration') {
+                    steps {
+                        dir('ci-config') {
+                            git branch: 'main', url: 'https://github.com/SanthoshJeeva440/automation-ci-config.git'
+                        }
+                        script {
+                            def config = readYaml file: 'ci-config/robotframework-selenium/config.yml'
+                            env.TEST_REPO_URL = config.project.repository
+                            env.TEST_REPO_BRANCH = config.project.branch
+                            env.TEST_DIR = config.project.test_directory
+                            env.REQUIREMENTS_FILE = config.project.requirements_file
+                            env.OUTPUT_DIR = config.project.output_directory
+                            env.ROBOT_ENV_VAR = config.robot.environment_variable ?: 'env'
+                            env.ROBOT_BROWSER_VAR = config.robot.browser_variable ?: 'browser'
+                            env.ROBOT_MODE_VAR = config.robot.mode_variable ?: 'mode'
+                        }
+                    }
+                }
+                stage('Checkout test repository') {
+                    steps {
+                        dir('robotframework_selenium') {
+                            git branch: env.TEST_REPO_BRANCH, url: env.TEST_REPO_URL
+                        }
+                    }
+                }
+                stage('Install dependencies') {
+                    steps {
+                        dir('robotframework_selenium') {
+                            sh '''
+                                set -eu
+                                python3 -m venv .venv
+                                . .venv/bin/activate
+                                python -m pip install --upgrade pip setuptools wheel
+                                python -m pip install -r "$REQUIREMENTS_FILE"
+                            '''
+                        }
+                    }
+                }
+                stage('Run Robot tests') {
+                    steps {
+                        dir('robotframework_selenium') {
+                            script {
+                                def tag = (params.TAGS ?: '').trim()
+                                if (tag.startsWith('@')) {
+                                    tag = tag.substring(1)
+                                }
+                                if (!tag) {
+                                    error('TAGS cannot be empty; enter a tag such as @smoke.')
+                                }
+                                def modeValue = params.HEADLESS ? '--headless' : '--headed'
+                                withEnv([
+                                    "RF_ENV_VALUE=${params.ENV}",
+                                    "RF_BROWSER_VALUE=${params.BROWSER}",
+                                    "RF_MODE_VALUE=${modeValue}",
+                                    "RF_TAG_VALUE=${tag}",
+                                    "RF_ENV_VAR=${env.ROBOT_ENV_VAR}",
+                                    "RF_BROWSER_VAR=${env.ROBOT_BROWSER_VAR}",
+                                    "RF_MODE_VAR=${env.ROBOT_MODE_VAR}",
+                                    "RF_TEST_DIR=${env.TEST_DIR}",
+                                    "RF_OUTPUT_DIR=${env.OUTPUT_DIR}"
+                                ]) {
+                                    sh '''
+                                        set +e
+                                        . .venv/bin/activate
+                                        python -m robot --outputdir "$RF_OUTPUT_DIR" --include "$RF_TAG_VALUE" --variable "$RF_ENV_VAR:$RF_ENV_VALUE" --variable "$RF_BROWSER_VAR:$RF_BROWSER_VALUE" --variable "$RF_MODE_VAR:$RF_MODE_VALUE" "$RF_TEST_DIR"
+                                        rc=$?
+                                        exit "$rc"
+                                    '''
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'robotframework_selenium/output/**', allowEmptyArchive: true
+            junit testResults: 'robotframework_selenium/output/xunit*.xml', allowEmptyResults: true
+            script {
+                if (params.EMAIL_TO?.trim()) {
+                    def result = currentBuild.currentResult
+                    def statusLabel = result == 'SUCCESS' ? 'PASSED' : (result == 'UNSTABLE' ? 'UNSTABLE' : 'FAILED')
+                    emailext(
+                        to: params.EMAIL_TO,
+                        subject: "[Robot Framework] ${statusLabel} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        mimeType: 'text/html',
+                        body: """
+                            <html><body>
+                                <h2>Robot Framework Test Execution Report</h2>
+                                <p><b>Project:</b> robotframework_selenium</p>
+                                <p><b>Build:</b> ${env.BUILD_NUMBER}</p>
+                                <p><b>Status:</b> ${statusLabel}</p>
+                                <p><b>Environment:</b> ${params.ENV}</p>
+                                <p><b>Browser:</b> ${params.BROWSER}</p>
+                                <p><b>Tags:</b> ${params.TAGS}</p>
+                                <p><b>Headless:</b> ${params.HEADLESS}</p>
+                                <p><b>Jenkins Build:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                                <p>Robot Framework reports are attached when available.</p>
+                            </body></html>
+                        """,
+                        attachmentsPattern: 'robotframework_selenium/output/report.html,robotframework_selenium/output/log.html,robotframework_selenium/output/output.xml',
+                        attachLog: true
+                    )
+                } else {
+                    echo 'Email skipped: EMAIL_TO parameter is empty.'
+                }
+            }
+        }
+    }
+}
