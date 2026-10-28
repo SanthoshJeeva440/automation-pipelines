@@ -11,7 +11,7 @@ pipeline {
     parameters {
         choice(name: 'AGENT', choices: ['linux-agent-1', 'mac-agent-1', 'Built-In Node', 'agent-git'], description: 'Select Jenkins agent')
         choice(name: 'ENV', choices: ['dev', 'qa', 'prod'], description: 'Target environment')
-        choice(name: 'BROWSER', choices: ['chromium', 'firefox', 'webkit'], description: 'Browser to use')
+        choice(name: 'BROWSER', choices: ['chrome', 'firefox', 'edge'], description: 'Browser to use')
         string(name: 'TAGS', defaultValue: '@smoke', trim: true, description: 'Robot tag to include')
         booleanParam(name: 'HEADLESS', defaultValue: true, description: 'Run browser tests headlessly')
         string(name: 'EMAIL_TO', defaultValue: 'santhoshjeeva440@gmail.com', trim: true, description: 'Email address to receive test execution results')
