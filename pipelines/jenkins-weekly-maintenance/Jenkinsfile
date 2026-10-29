@@ -1,0 +1,32 @@
+pipeline {
+    agent any
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+        timeout(time: 5, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '12'))
+    }
+    triggers { cron('H 8 * * 0') }
+    stages {
+        stage('Launch independent maintenance service') {
+            steps {
+                sh '''
+                    set -eu
+                    sudo /usr/bin/systemd-run \
+                      --unit=jenkins-weekly-maintenance \
+                      --collect \
+                      --property=Type=exec \
+                      /usr/local/sbin/jenkins-weekly-maintenance.sh
+                '''
+            }
+        }
+    }
+    post {
+        success {
+            echo 'Maintenance service launched. The host script sends the final Gmail report after Jenkins restarts.'
+        }
+        failure {
+            echo 'Could not launch maintenance. Check sudoers and the console log.'
+        }
+    }
+}
