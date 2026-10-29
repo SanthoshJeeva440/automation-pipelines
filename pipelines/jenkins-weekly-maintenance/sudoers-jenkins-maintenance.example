@@ -1,0 +1,2 @@
+# Install with: sudo visudo -f /etc/sudoers.d/jenkins-weekly-maintenance
+jenkins ALL=(root) NOPASSWD: /usr/bin/systemd-run --unit=jenkins-weekly-maintenance --collect --property=Type=exec /usr/local/sbin/jenkins-weekly-maintenance.sh
