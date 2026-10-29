@@ -6,8 +6,8 @@ ENV_FILE=/etc/jenkins-weekly-maintenance.env
 LOG=/var/log/jenkins-weekly-maintenance.log
 BACKUP_ROOT=/var/backups/jenkins-weekly-maintenance
 JENKINS_HOME="${JENKINS_HOME:-/var/lib/jenkins}"
-JENKINS_URL="${JENKINS_URL:-http://127.0.0.1:8080}"
-HEALTH_URL="${JENKINS_HEALTH_URL:-http://127.0.0.1:8080/login}"
+JENKINS_URL="${JENKINS_URL:-http://192.168.0.104:8080}"
+HEALTH_URL="${JENKINS_HEALTH_URL:-http://192.168.0.104:8080/login}"
 HEALTH_TIMEOUT=300
 mkdir -p "$BACKUP_ROOT"
 touch "$LOG"
