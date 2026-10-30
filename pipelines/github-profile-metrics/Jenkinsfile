@@ -19,7 +19,9 @@ pipeline {
 
     stages {
         stage('Checkout pipeline repository') {
-            steps { checkout scm }
+            steps {
+                checkout scm
+            }
         }
 
         stage('Checkout CI configuration') {
@@ -28,12 +30,21 @@ pipeline {
                     git branch: 'main',
                         url: 'https://github.com/SanthoshJeeva440/automation-ci-config.git'
                 }
+
                 script {
                     def config = readYaml file: 'ci-config/github-profile-metrics/config.yml'
+
                     env.GITHUB_METRICS_REPO_URL = config.project.runner_repository
                     env.GITHUB_METRICS_REPO_BRANCH = config.project.runner_branch ?: 'main'
                     env.GITHUB_METRICS_CRON = config.jenkins.cron ?: 'H 7 * * *'
-                    properties([pipelineTriggers([cron(env.GITHUB_METRICS_CRON)])])
+
+                    properties([
+                        pipelineTriggers([
+                            cron(env.GITHUB_METRICS_CRON)
+                        ])
+                    ])
+
+                    echo "Daily schedule configured: ${env.GITHUB_METRICS_CRON}"
                 }
             }
         }
@@ -43,12 +54,31 @@ pipeline {
                 dir('automation-grafana') {
                     git branch: env.GITHUB_METRICS_REPO_BRANCH,
                         url: env.GITHUB_METRICS_REPO_URL
+
+                    // Validate files from inside automation-grafana
+                    sh '''
+                        set -eu
+
+                        echo "Checking GitHub metrics runner..."
+
+                        if [ ! -f runners/github_profile_metrics_runner.py ]; then
+                            echo "ERROR: GitHub metrics runner not found!"
+                            exit 1
+                        fi
+
+                        if [ ! -f requirements.txt ]; then
+                            echo "ERROR: requirements.txt not found!"
+                            exit 1
+                        fi
+
+                        if [ ! -f integrations/influxdb_writer.py ]; then
+                            echo "ERROR: integrations/influxdb_writer.py not found!"
+                            exit 1
+                        fi
+
+                        echo "All required files are available."
+                    '''
                 }
-                sh '''
-                    set -eu
-                    test -f runners/github_profile_metrics_runner.py
-                    test -f requirements.txt
-                '''
             }
         }
 
@@ -57,11 +87,13 @@ pipeline {
                 dir('automation-grafana') {
                     sh '''
                         set -eu
+
                         python3 -m venv .venv
-                        . .venv/bin/activate
-                        python -m pip install --upgrade pip
-                        pip install -r requirements.txt
-                        pip install PyYAML
+                        .venv/bin/python -m pip install --upgrade pip
+                        .venv/bin/pip install -r requirements.txt
+                        .venv/bin/pip install PyYAML
+
+                        echo "Dependencies installed successfully."
                     '''
                 }
             }
@@ -70,11 +102,18 @@ pipeline {
         stage('Collect GitHub profile and repository metrics') {
             steps {
                 withCredentials([
-                    string(credentialsId: 'github-read-token', variable: 'GITHUB_TOKEN'),
-                    string(credentialsId: 'influx-cloud-token', variable: 'INFLUX_TOKEN')
+                    string(
+                        credentialsId: 'github-read-token',
+                        variable: 'GITHUB_TOKEN'
+                    ),
+                    string(
+                        credentialsId: 'influx-cloud-token',
+                        variable: 'INFLUX_TOKEN'
+                    )
                 ]) {
                     script {
                         def config = readYaml file: 'ci-config/github-profile-metrics/config.yml'
+
                         withEnv([
                             "GITHUB_USERNAME=${config.github.username}",
                             "GITHUB_INCLUDE_FORKS=${config.collection.include_forks}",
@@ -85,8 +124,12 @@ pipeline {
                             dir('automation-grafana') {
                                 sh '''
                                     set -eu
-                                    . .venv/bin/activate
-                                    python runners/github_profile_metrics_runner.py
+
+                                    echo "Starting GitHub metrics collection..."
+
+                                    .venv/bin/python runners/github_profile_metrics_runner.py
+
+                                    echo "GitHub metrics collection completed."
                                 '''
                             }
                         }
@@ -98,21 +141,35 @@ pipeline {
 
     post {
         always {
-            archiveArtifacts artifacts: 'automation-grafana/github_metrics_report.json',
+            archiveArtifacts(
+                artifacts: 'automation-grafana/github_metrics_report.json',
                 allowEmptyArchive: true
+            )
         }
+
         failure {
             script {
                 def configPath = 'ci-config/github-profile-metrics/config.yml'
+
                 if (fileExists(configPath)) {
                     def config = readYaml file: configPath
+
                     if (config?.notifications?.email?.enabled &&
                         config?.notifications?.email?.send_failure_alert &&
                         config?.notifications?.email?.to?.trim()) {
+
                         emailext(
                             to: config.notifications.email.to,
                             subject: "[GitHub Metrics] FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                            body: "GitHub profile metrics collection failed. Review: ${env.BUILD_URL}console",
+                            body: """
+                                GitHub profile metrics collection failed.
+
+                                Job: ${env.JOB_NAME}
+                                Build: #${env.BUILD_NUMBER}
+
+                                Review console output:
+                                ${env.BUILD_URL}console
+                            """,
                             attachLog: true
                         )
                     }
