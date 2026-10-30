@@ -1,0 +1,123 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 45, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+
+    environment {
+        INFLUX_URL = 'https://us-east-1-1.aws.cloud2.influxdata.com'
+        INFLUX_BUCKET = 'qa_metrics'
+        INFLUX_DATABASE = 'qa_metrics'
+        INFLUX_RETENTION_POLICY = 'autogen'
+        PYTHONUNBUFFERED = '1'
+    }
+
+    stages {
+        stage('Checkout pipeline repository') {
+            steps { checkout scm }
+        }
+
+        stage('Checkout CI configuration') {
+            steps {
+                dir('ci-config') {
+                    git branch: 'main',
+                        url: 'https://github.com/SanthoshJeeva440/automation-ci-config.git'
+                }
+                script {
+                    def config = readYaml file: 'ci-config/github-profile-metrics/config.yml'
+                    env.GITHUB_METRICS_REPO_URL = config.project.runner_repository
+                    env.GITHUB_METRICS_REPO_BRANCH = config.project.runner_branch ?: 'main'
+                    env.GITHUB_METRICS_CRON = config.jenkins.cron ?: 'H 7 * * *'
+                    properties([pipelineTriggers([cron(env.GITHUB_METRICS_CRON)])])
+                }
+            }
+        }
+
+        stage('Checkout Grafana metrics repository') {
+            steps {
+                dir('automation-grafana') {
+                    git branch: env.GITHUB_METRICS_REPO_BRANCH,
+                        url: env.GITHUB_METRICS_REPO_URL
+                }
+                sh '''
+                    set -eu
+                    test -f runners/github_profile_metrics_runner.py
+                    test -f requirements.txt
+                '''
+            }
+        }
+
+        stage('Install dependencies') {
+            steps {
+                dir('automation-grafana') {
+                    sh '''
+                        set -eu
+                        python3 -m venv .venv
+                        . .venv/bin/activate
+                        python -m pip install --upgrade pip
+                        pip install -r requirements.txt
+                        pip install PyYAML
+                    '''
+                }
+            }
+        }
+
+        stage('Collect GitHub profile and repository metrics') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'github-read-token', variable: 'GITHUB_TOKEN'),
+                    string(credentialsId: 'influx-cloud-token', variable: 'INFLUX_TOKEN')
+                ]) {
+                    script {
+                        def config = readYaml file: 'ci-config/github-profile-metrics/config.yml'
+                        withEnv([
+                            "GITHUB_USERNAME=${config.github.username}",
+                            "GITHUB_INCLUDE_FORKS=${config.collection.include_forks}",
+                            "GITHUB_INCLUDE_ARCHIVED=${config.collection.include_archived}",
+                            "GITHUB_MAX_REPOSITORIES=${config.collection.max_repositories}",
+                            "GITHUB_METRICS_MEASUREMENT_PREFIX=${config.influxdb.measurement_prefix}"
+                        ]) {
+                            dir('automation-grafana') {
+                                sh '''
+                                    set -eu
+                                    . .venv/bin/activate
+                                    python runners/github_profile_metrics_runner.py
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'automation-grafana/github_metrics_report.json',
+                allowEmptyArchive: true
+        }
+        failure {
+            script {
+                def configPath = 'ci-config/github-profile-metrics/config.yml'
+                if (fileExists(configPath)) {
+                    def config = readYaml file: configPath
+                    if (config?.notifications?.email?.enabled &&
+                        config?.notifications?.email?.send_failure_alert &&
+                        config?.notifications?.email?.to?.trim()) {
+                        emailext(
+                            to: config.notifications.email.to,
+                            subject: "[GitHub Metrics] FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                            body: "GitHub profile metrics collection failed. Review: ${env.BUILD_URL}console",
+                            attachLog: true
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
