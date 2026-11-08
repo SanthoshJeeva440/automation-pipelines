@@ -1,0 +1,32 @@
+name: AI Pull Request Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  models: read
+
+concurrency:
+  group: ai-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ai-review:
+    if: github.event.pull_request.draft == false
+    uses: SanthoshJeeva440/code-review/.github/workflows/review.yml@main
+    with:
+      provider: github-models
+      model: openai/gpt-4.1-mini
+      min_severity: low
+      max_comments: 25
+      fail_on: none
+      review_drafts: false
+      action_ref: main
+      extra_instructions: |
+        Review this repository as Jenkins pipeline and CI orchestration code.
+        Prioritize Groovy/Jenkins Pipeline correctness, shell safety, credential handling,
+        secret exposure, YAML parsing, checkout paths, build reliability, timeouts,
+        retry behavior, and notification failures.

@@ -1,0 +1,121 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '12'))
+        timeout(time: 30, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+
+    stages {
+        stage('Checkout pipeline repository') {
+            steps { checkout scm }
+        }
+
+        stage('Checkout CI configuration') {
+            steps {
+                dir('ci-config') {
+                    git branch: 'main',
+                        url: 'https://github.com/SanthoshJeeva440/automation-ci-config.git'
+                }
+                script {
+                    def cfg = readYaml file: 'ci-config/code-review-agent/config.yml'
+                    if (!cfg?.jenkins?.cron) {
+                        error('Missing jenkins.cron in code-review-agent/config.yml')
+                    }
+                    properties([pipelineTriggers([cron(cfg.jenkins.cron)])])
+                    echo "Monthly report schedule: ${cfg.jenkins.cron} (${cfg.jenkins.timezone})"
+                }
+            }
+        }
+
+        stage('Prepare report environment') {
+            steps {
+                sh '''
+                    set -eu
+                    python3 -m venv .venv-code-review-report
+                    .venv-code-review-report/bin/python -m pip install --upgrade pip
+                    .venv-code-review-report/bin/pip install -r ci-config/code-review-agent/requirements.txt
+                '''
+            }
+        }
+
+        stage('Collect monthly GitHub activity') {
+            steps {
+                script {
+                    def cfg = readYaml file: 'ci-config/code-review-agent/config.yml'
+                    withCredentials([string(
+                        credentialsId: cfg.project.github_token_credential_id,
+                        variable: 'GITHUB_TOKEN'
+                    )]) {
+                        withEnv([
+                            'REPORT_CONFIG=ci-config/code-review-agent/config.yml',
+                            'REPORT_DIR=reports'
+                        ]) {
+                            sh '''
+                                set -eu
+                                .venv-code-review-report/bin/python \\
+                                  ci-config/code-review-agent/monthly_report.py \\
+                                  --config "$REPORT_CONFIG" \\
+                                  --output-dir "$REPORT_DIR"
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+        }
+        success {
+            script {
+                def cfg = readYaml file: 'ci-config/code-review-agent/config.yml'
+                def emailCfg = cfg?.notifications?.email ?: [:]
+                if (emailCfg.enabled && emailCfg.to?.trim()) {
+                    emailext(
+                        to: emailCfg.to,
+                        subject: "${emailCfg.subject_prefix ?: '[Monthly Code Review Report]'} ${new Date().format('MMMM yyyy', TimeZone.getTimeZone('Asia/Kolkata'))}",
+                        body: """Monthly GitHub code review activity report is attached.
+
+Job: ${env.JOB_NAME}
+Build: ${env.BUILD_URL}
+
+The HTML report includes pull request counts, commit counts, failed check runs,
+and Jenkins review workflow failures for the previous month.
+""",
+                        mimeType: 'text/plain',
+                        attachmentsPattern: emailCfg.attach_html ? 'reports/monthly-code-review-report.html' : ''
+                    )
+                }
+            }
+        }
+        failure {
+            script {
+                try {
+                    def cfg = readYaml file: 'ci-config/code-review-agent/config.yml'
+                    def emailCfg = cfg?.notifications?.email ?: [:]
+                    if (emailCfg.enabled && emailCfg.to?.trim()) {
+                        emailext(
+                            to: emailCfg.to,
+                            subject: '[Monthly Code Review Report] FAILED: ' + env.JOB_NAME + ' #' + env.BUILD_NUMBER,
+                            body: """Monthly code review report generation failed.
+
+Job: ${env.JOB_NAME}
+Build: ${env.BUILD_URL}
+Review the Jenkins console output for details.
+""",
+                            attachLog: true
+                        )
+                    }
+                } catch (Exception e) {
+                    echo "Could not send failure email: ${e.getMessage()}"
+                }
+            }
+        }
+    }
+}
