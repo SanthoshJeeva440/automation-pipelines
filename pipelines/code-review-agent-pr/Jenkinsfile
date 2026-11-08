@@ -1,0 +1,242 @@
+def publishGitHubStatus(String state, String description) {
+    if (!env.REPOSITORY?.trim() || !env.PR_HEAD_SHA?.trim()) {
+        echo 'PR metadata is missing; GitHub commit status was not updated.'
+        return
+    }
+    def payload = groovy.json.JsonOutput.toJson([
+        state: state,
+        context: 'jenkins/pr-validation',
+        description: description.take(140),
+        target_url: env.BUILD_URL ?: ''
+    ])
+    writeFile file: '.github-status.json', text: payload
+    withCredentials([string(credentialsId: 'github-pr-status-token', variable: 'GITHUB_TOKEN')]) {
+        sh '''
+            set +x
+            curl --fail --silent --show-error \
+              -X POST \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/json" \
+              --data-binary @.github-status.json \
+              "https://api.github.com/repos/${REPOSITORY}/statuses/${PR_HEAD_SHA}"
+        '''
+    }
+}
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds(abortPrevious: false)
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timeout(time: 20, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        string(name: 'REPOSITORY', defaultValue: '', description: 'owner/repository from GitHub PR event')
+        string(name: 'PR_NUMBER', defaultValue: '', description: 'GitHub pull request number')
+        string(name: 'PR_HEAD_SHA', defaultValue: '', description: 'Exact PR head commit SHA')
+        string(name: 'PR_HEAD_REF', defaultValue: '', description: 'PR source branch')
+        string(name: 'HEAD_REPOSITORY', defaultValue: '', description: 'owner/repository containing PR head commit')
+        string(name: 'PR_BASE_REF', defaultValue: '', description: 'PR target branch')
+        string(name: 'PR_URL', defaultValue: '', description: 'PR URL')
+        string(name: 'PR_TITLE', defaultValue: '', description: 'PR title')
+        string(name: 'REVIEW_RESULT', defaultValue: 'unknown', description: 'GitHub AI review job result')
+        string(name: 'REVIEW_FINDINGS', defaultValue: '0', description: 'Number of AI findings')
+        string(name: 'REVIEW_WORST_SEVERITY', defaultValue: 'unknown', description: 'Highest AI review severity')
+    }
+
+    triggers {
+        GenericTrigger(
+            genericVariables: [
+                [key: 'REPOSITORY', value: '$.repository.full_name'],
+                [key: 'PR_NUMBER', value: '$.pull_request.number'],
+                [key: 'PR_HEAD_SHA', value: '$.pull_request.head.sha'],
+                [key: 'PR_HEAD_REF', value: '$.pull_request.head.ref'],
+                [key: 'HEAD_REPOSITORY', value: '$.pull_request.head.repo.full_name'],
+                [key: 'PR_BASE_REF', value: '$.pull_request.base.ref'],
+                [key: 'PR_URL', value: '$.pull_request.html_url'],
+                [key: 'PR_TITLE', value: '$.pull_request.title'],
+                [key: 'REVIEW_RESULT', value: '$.review.result'],
+                [key: 'REVIEW_FINDINGS', value: '$.review.findings'],
+                [key: 'REVIEW_WORST_SEVERITY', value: '$.review.worst_severity']
+            ],
+            causeString: 'AI code review completed for $REPOSITORY PR #$PR_NUMBER',
+            tokenCredentialId: 'jenkins-pr-trigger-token',
+            printContributedVariables: false,
+            printPostContent: false,
+            silentResponse: false
+        )
+    }
+
+    stages {
+        stage('Validate webhook payload') {
+            steps {
+                script {
+                    def allowed = [
+                        'SanthoshJeeva440/automation-pipelines',
+                        'SanthoshJeeva440/automation-ci-config'
+                    ]
+                    if (!allowed.contains(env.REPOSITORY)) {
+                        error("Repository is not allowed: ${env.REPOSITORY}")
+                    }
+                    if (!(env.PR_NUMBER ==~ /[0-9]+/) || !(env.PR_HEAD_SHA ==~ /[0-9a-fA-F]{40}/)) {
+                        error('PR_NUMBER or PR_HEAD_SHA is missing/invalid.')
+                    }
+                    if (!env.HEAD_REPOSITORY?.trim()) { env.HEAD_REPOSITORY = env.REPOSITORY }
+                    if (!(env.HEAD_REPOSITORY ==~ /[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/)) { error('HEAD_REPOSITORY is invalid.') }
+                    echo "Processing ${env.REPOSITORY} PR #${env.PR_NUMBER} (${env.PR_HEAD_SHA.take(7)}) from ${env.HEAD_REPOSITORY}"
+                    publishGitHubStatus('pending', 'Jenkins PR validation is running')
+                }
+            }
+        }
+
+        stage('Checkout validation configuration') {
+            steps {
+                dir('ci-config') {
+                    git branch: 'main',
+                        url: 'https://github.com/SanthoshJeeva440/automation-ci-config.git'
+                }
+                script {
+                    def cfg = readYaml file: 'ci-config/code-review-agent/config.yml'
+                    env.REPORT_EMAIL = cfg.notifications.email.to ?: ''
+                    env.GITHUB_API_URL = cfg.project.github_api_url ?: 'https://api.github.com'
+                }
+            }
+        }
+
+        stage('Download PR source snapshot') {
+            steps {
+                withCredentials([string(credentialsId: 'github-read-token', variable: 'GITHUB_TOKEN')]) {
+                    sh '''
+                        set -eu
+                        set +x
+                        mkdir -p pr-source reports
+                        curl --fail --silent --show-error --location \
+                          -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                          -H "Accept: application/vnd.github+json" \
+                          "${GITHUB_API_URL}/repos/${HEAD_REPOSITORY}/zipball/${PR_HEAD_SHA}" \
+                          -o pr-source.zip
+                        unzip -q pr-source.zip -d pr-source
+                        find pr-source -mindepth 1 -maxdepth 1 -type d -print -quit > source-dir.txt
+                        test -s source-dir.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Install validation dependencies') {
+            steps {
+                sh '''
+                    set -eu
+                    python3 -m venv .venv-code-review
+                    .venv-code-review/bin/python -m pip install --disable-pip-version-check --upgrade pip
+                    .venv-code-review/bin/pip install -r ci-config/code-review-agent/requirements.txt
+                '''
+            }
+        }
+
+        stage('Validate YAML and Jenkinsfiles') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'github-read-token', variable: 'GITHUB_TOKEN'),
+                    usernamePassword(
+                        credentialsId: 'jenkins-api-user-token',
+                        usernameVariable: 'JENKINS_LINTER_USER',
+                        passwordVariable: 'JENKINS_LINTER_TOKEN'
+                    )
+                ]) {
+                    sh '''#!/usr/bin/env bash
+                        set -euo pipefail
+                        SOURCE_DIR="$(cat source-dir.txt)"
+                        .venv-code-review/bin/python \
+                          ci-config/code-review-agent/validate_repo.py \
+                          --source "$SOURCE_DIR" \
+                          --repository "$REPOSITORY" \
+                          --pr-number "$PR_NUMBER" \
+                          2>&1 | tee reports/pr-validation.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Fetch AI review details for email') {
+            steps {
+                withCredentials([string(credentialsId: 'github-read-token', variable: 'GITHUB_TOKEN')]) {
+                    sh '''
+                        set -eu
+                        .venv-code-review/bin/python \
+                          ci-config/code-review-agent/fetch_review.py \
+                          --repository "$REPOSITORY" \
+                          --pr "$PR_NUMBER" \
+                          --workflow-result "$REVIEW_RESULT" \
+                          --output reports/ai-review-result.html
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+        }
+        success {
+            script {
+                publishGitHubStatus('success', 'Jenkins PR validation passed')
+                def emailTo = env.REPORT_EMAIL?.trim() ?: 'santhoshjeeva440@gmail.com'
+                emailext(
+                    to: emailTo,
+                    subject: "[AI Code Review] PASSED: ${env.REPOSITORY} PR #${env.PR_NUMBER}",
+                    mimeType: 'text/html',
+                    body: """
+                        <h2>Pull request validation passed</h2>
+                        <p><b>Repository:</b> ${env.REPOSITORY}</p>
+                        <p><b>Pull request:</b> <a href="${env.PR_URL}">#${env.PR_NUMBER} - ${env.PR_TITLE}</a></p>
+                        <p><b>Commit:</b> ${env.PR_HEAD_SHA}</p>
+                        <p><b>AI review job:</b> ${env.REVIEW_RESULT}</p>
+                        <p><b>AI findings:</b> ${env.REVIEW_FINDINGS}</p>
+                        <p><b>Highest severity:</b> ${env.REVIEW_WORST_SEVERITY}</p>
+                        <p><b>Jenkins validation:</b> PASSED</p>
+                        <p>Build: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                        <p>The complete AI review summary and inline findings are attached as an HTML report.</p>
+                    """,
+                    attachmentsPattern: 'reports/ai-review-result.html,reports/pr-validation.txt'
+                )
+            }
+        }
+        failure {
+            script {
+                try {
+                    publishGitHubStatus('failure', 'Jenkins PR validation failed')
+                } catch (Exception statusError) {
+                    echo "Could not publish GitHub status: ${statusError.getMessage()}"
+                }
+                def emailTo = env.REPORT_EMAIL?.trim() ?: 'santhoshjeeva440@gmail.com'
+                emailext(
+                    to: emailTo,
+                    subject: "[AI Code Review] FAILED: ${env.REPOSITORY} PR #${env.PR_NUMBER}",
+                    mimeType: 'text/html',
+                    attachLog: true,
+                    body: """
+                        <h2>Pull request validation failed</h2>
+                        <p><b>Repository:</b> ${env.REPOSITORY}</p>
+                        <p><b>Pull request:</b> <a href="${env.PR_URL}">#${env.PR_NUMBER} - ${env.PR_TITLE}</a></p>
+                        <p><b>Commit:</b> ${env.PR_HEAD_SHA}</p>
+                        <p><b>AI review job:</b> ${env.REVIEW_RESULT}</p>
+                        <p><b>AI findings:</b> ${env.REVIEW_FINDINGS}</p>
+                        <p><b>Highest severity:</b> ${env.REVIEW_WORST_SEVERITY}</p>
+                        <p><b>Jenkins validation:</b> FAILED. See attached build log and archived report.</p>
+                        <p>Build: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                        <p>The latest AI review summary is attached when available.</p>
+                    """,
+                    attachmentsPattern: 'reports/ai-review-result.html,reports/pr-validation.txt'
+                )
+            }
+        }
+    }
+}

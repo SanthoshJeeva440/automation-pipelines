@@ -1,0 +1,110 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '12'))
+        timeout(time: 30, unit: 'MINUTES')
+        skipDefaultCheckout(true)
+    }
+
+    environment {
+        PYTHONUNBUFFERED = '1'
+    }
+
+    stages {
+        stage('Checkout pipeline repository') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Checkout CI configuration') {
+            steps {
+                dir('ci-config') {
+                    git branch: 'main',
+                        url: 'https://github.com/SanthoshJeeva440/automation-ci-config.git'
+                }
+                script {
+                    def cfg = readYaml file: 'ci-config/code-review-agent/config.yml'
+                    def schedule = cfg?.jenkins?.monthly_cron ?: '0 7 1 * *'
+                    properties([pipelineTriggers([cron(schedule)])])
+                    env.REPORT_EMAIL = cfg?.notifications?.email?.to ?: 'santhoshjeeva440@gmail.com'
+                    echo "Monthly code review report schedule: ${schedule} (${cfg?.jenkins?.timezone ?: 'Jenkins controller timezone'})"
+                }
+            }
+        }
+
+        stage('Install report dependencies') {
+            steps {
+                sh '''
+                    set -eu
+                    python3 -m venv .venv-code-review-report
+                    .venv-code-review-report/bin/python -m pip install --disable-pip-version-check --upgrade pip
+                    .venv-code-review-report/bin/pip install -r ci-config/code-review-agent/requirements.txt
+                '''
+            }
+        }
+
+        stage('Generate monthly HTML report') {
+            steps {
+                withCredentials([string(credentialsId: 'github-read-token', variable: 'GITHUB_TOKEN')]) {
+                    sh '''
+                        set -eu
+                        mkdir -p reports
+                        .venv-code-review-report/bin/python \
+                          ci-config/code-review-agent/monthly_report.py \
+                          --config ci-config/code-review-agent/config.yml \
+                          --output-dir reports
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+        }
+        success {
+            script {
+                def cfg = readYaml file: 'ci-config/code-review-agent/config.yml'
+                def emailCfg = cfg?.notifications?.email ?: [:]
+                if (emailCfg.enabled && emailCfg.to?.trim()) {
+                    emailext(
+                        to: emailCfg.to,
+                        subject: "${emailCfg.monthly_subject_prefix ?: '[Monthly AI Code Review Report]'} ${new Date().format('MMMM yyyy', TimeZone.getTimeZone('Asia/Kolkata'))}",
+                        body: """
+                            <h2>Monthly AI Code Review Report</h2>
+                            <p>The HTML report for the previous calendar month is attached.</p>
+                            <p>It includes pull requests created, default-branch commits, total workflow runs,
+                            failed workflow runs and failed AI-review workflow runs.</p>
+                            <p>Jenkins build: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                        """,
+                        mimeType: 'text/html',
+                        attachmentsPattern: 'reports/monthly-code-review-report.html'
+                    )
+                }
+            }
+        }
+        failure {
+            script {
+                try {
+                    def cfg = readYaml file: 'ci-config/code-review-agent/config.yml'
+                    def emailCfg = cfg?.notifications?.email ?: [:]
+                    if (emailCfg.enabled && emailCfg.to?.trim()) {
+                        emailext(
+                            to: emailCfg.to,
+                            subject: '[Monthly AI Code Review Report] FAILED: ' + env.JOB_NAME + ' #' + env.BUILD_NUMBER,
+                            body: "Monthly report generation failed.\n\nJob: ${env.JOB_NAME}\nBuild: ${env.BUILD_URL}\nReview Jenkins console output for details.",
+                            attachLog: true
+                        )
+                    }
+                } catch (Exception notificationError) {
+                    echo "Could not send monthly report failure email: ${notificationError.getMessage()}"
+                }
+            }
+        }
+    }
+}
